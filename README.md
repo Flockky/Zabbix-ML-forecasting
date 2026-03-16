@@ -1,18 +1,3 @@
-Ниже готовый **GitHub/GitLab README.md** в markdown. Он включает:
-
-- описание проекта  
-- архитектуру пайплайна  
-- инструкции по разворачиванию  
-- описание всех скриптов  
-- SQL для создания таблиц  
-- переменные окружения  
-- CI pipeline  
-- интеграцию с Grafana  
-
-Я сделал его таким, чтобы его можно было **сразу положить в README.md**.
-
----
-
 # 📊 Zabbix Disk Capacity Forecast
 
 Сервис для **ежедневного прогнозирования заполнения файловых систем** на основе данных из **Zabbix**.
@@ -31,47 +16,34 @@ Pipeline запускается **раз в сутки через GitLab CI**.
 
 # 🏗 Архитектура
 
-Pipeline состоит из 4 этапов:
+### Архитектурная схема
 
-```
-discover_mountpoints
-        │
-        ▼
-sync_trends
-        │
-        ▼
-run_forecast
-        │
-        ▼
-demo_forecast
+```mermaid
+graph TD;
+    A[Zabbix] --> B[discover_mountpoints.py]
+    B --> C[sync_trends.py]
+    C --> D[run_forecast.py]
+    D --> E[demo_forecast.py]
+    E --> F[PostgreSQL]
+    F --> G[Grafana Dashboard]
 ```
 
-### 1️⃣ Discover
-Поиск всех дисков в Zabbix.
+### Описание этапов:
 
-### 2️⃣ Sync
-Синхронизация трендов Zabbix в локальную PostgreSQL.
+1. **Discover**: 
+    - Сканирует активные хосты и находит все mountpoints.
+    - Добавляет/обновляет информацию о дисках в таблицу `prediction_targets`.
+   
+2. **Sync**: 
+    - Синхронизирует данные по трендам использования дисков в базу данных PostgreSQL.
+   
+3. **Forecast**: 
+    - Строит прогнозы на 90 дней с использованием **NeuralProphet**.
+    - Сохраняет прогнозы в таблицу `forecasts`.
 
-### 3️⃣ Forecast
-Построение прогноза заполнения дисков.
-
-### 4️⃣ Demo
-Генерация демо-прогнозов для сравнения с реальными данными.
-
----
-
-# 📦 Структура проекта
-
-```
-.
-├── discover_mountpoints.py
-├── sync_trends.py
-├── run_forecast.py
-├── demo_forecast.py
-├── .gitlab-ci.yml
-├── grafana_dashboard.json
-└── README.md
-```
+4. **Demo**: 
+    - Генерирует демо-прогнозы и сравнивает их с реальными значениями.
+    - Результаты сохраняются в таблицу `demo_forecasts`.
 
 ---
 
@@ -93,8 +65,6 @@ pip install pandas psycopg2-binary requests neuralprophet torch
 
 Создайте PostgreSQL базу и выполните SQL ниже.
 
----
-
 ## Таблица: `prediction_targets`
 
 Список дисков для прогнозирования.
@@ -111,8 +81,6 @@ CREATE TABLE IF NOT EXISTS public.prediction_targets
     last_discovered_at timestamp with time zone DEFAULT now()
 );
 ```
-
----
 
 ## Таблица: `zabbix_trends`
 
@@ -132,8 +100,6 @@ CREATE UNIQUE INDEX idx_zabbix_trends_itemid_clock
 ON public.zabbix_trends (itemid, clock);
 ```
 
----
-
 ## Таблица: `disk_total`
 
 Хранит общий размер диска.
@@ -147,8 +113,6 @@ CREATE TABLE IF NOT EXISTS public.disk_total
     updated_at timestamp with time zone DEFAULT now()
 );
 ```
-
----
 
 ## Таблица: `forecasts`
 
@@ -178,8 +142,6 @@ ON public.forecasts (itemid, forecast_run_at DESC);
 CREATE INDEX idx_forecasts_run_id
 ON public.forecasts (run_id);
 ```
-
----
 
 ## Таблица: `demo_forecasts`
 
@@ -234,24 +196,22 @@ DB_HOST=localhost
 - ищет items `vfs.fs.size`
 - сопоставляет пары:
 
-```
+```id="s8s5h8"
 used
 total
 ```
 
 - сохраняет их в таблицу:
 
-```
+```id="51l1me"
 prediction_targets
 ```
 
 Также обновляет:
 
-```
+```id="s3657l"
 last_discovered_at
 ```
-
----
 
 ## sync_trends.py
 
@@ -263,7 +223,7 @@ last_discovered_at
 - агрегирует данные до **дневных значений**
 - сохраняет их в:
 
-```
+```id="il2qgi"
 zabbix_trends
 ```
 
@@ -272,15 +232,13 @@ zabbix_trends
 - обновляет размер диска в `disk_total`
 - удаляет данные старше **365 дней**
 
----
-
 ## run_forecast.py
 
 🧠 Основной скрипт прогнозирования.
 
 Использует библиотеку:
 
-```
+```id="eb8koz"
 NeuralProphet
 ```
 
@@ -298,11 +256,9 @@ NeuralProphet
 
 Результаты сохраняются в:
 
-```
+```id="0tyr4s"
 forecasts
 ```
-
----
 
 ## demo_forecast.py
 
@@ -316,7 +272,7 @@ forecasts
 
 Результаты сохраняются в:
 
-```
+```id="ueh17c"
 demo_forecasts
 ```
 
@@ -331,7 +287,7 @@ demo_forecasts
 
 Файл:
 
-```
+```id="8knzrc"
 .gitlab-ci.yml
 ```
 
@@ -354,8 +310,6 @@ discover_mountpoints:
     - /usr/bin/python3.9 discover_mountpoints.py
 ```
 
----
-
 ### Sync
 
 ```yaml
@@ -365,8 +319,6 @@ sync_trends:
     - /usr/bin/python3.9 sync_trends.py
 ```
 
----
-
 ### Forecast
 
 ```yaml
@@ -375,8 +327,6 @@ run_forecast:
   script:
     - /usr/bin/python3.9 run_forecast.py
 ```
-
----
 
 ### Demo
 
@@ -395,13 +345,13 @@ demo_forecast:
 
 Импортируйте файл:
 
-```
+```id="vrvmqj"
 grafana_dashboard.json
 ```
 
 В Grafana:
 
-```
+```id="mfopbv"
 Dashboards → Import → Upload JSON
 ```
 
@@ -409,63 +359,20 @@ Datasource: **PostgreSQL**
 
 ---
 
-# 📊 Что показывает дашборд
+# 🧠 Как работает модель **NeuralProphet**
 
-- текущий usage диска
-- прогноз на 90 дней
-- доверительный интервал
-- сравнение прогноз vs реальность
-- дата достижения порога заполнения
+Модель **NeuralProphet** — это улучшение библиотеки Prophet с использованием нейронных сетей. Она позволяет учитывать сезонные колебания в данных и корректировать прогнозы с учетом этих паттернов. В отличие от традиционного **Prophet**, NeuralProphet использует **глубокие нейронные сети** для обработки данных.
 
----
+Основные параметры модели:
 
-# 🕒 Планировщик
+- **yearly_seasonality**: отключена (предположено, что для большинства дисков годовая сезонность не имеет значения)
+- **weekly_seasonality**: включена (еженедельные циклы важны для использования дисков)
+- **daily_seasonality**: отключена
+- **growth**: линейный рост (предполагается, что заполнение дисков будет расти линейно)
+- **epochs**: 30 (количество эпох для обучения)
+- **batch_size**: 64 (размер батча)
+- **learning_rate**: 1.0
 
-Pipeline рекомендуется запускать **раз в сутки**.
-
-Например:
-
-```
-02:00 AM
-```
+Модель обучается на **исторических данных** о заполнении дисков за последний год, а затем делает прогнозы на **90 дней вперед**.
 
 ---
-
-# 📉 Оптимизации
-
-Проект оптимизирован для:
-
-- параллельной обработки дисков
-- многопоточности CPU
-- хранения только **365 дней истории**
-
----
-
-# 🧠 Используемые технологии
-
-- Python
-- PostgreSQL
-- Zabbix API
-- NeuralProphet
-- PyTorch
-- Pandas
-- Grafana
-- GitLab CI
-
----
-
-# 📜 Лицензия
-
-Internal infrastructure tool.
-
----
-
-Если хочешь, я могу ещё улучшить README и добавить:
-
-- 📊 **архитектурную схему (Mermaid diagram)**  
-- 📈 **пример графика прогноза**  
-- ⚡ **docker-compose для запуска**  
-- 🧠 **раздел "Как работает модель NeuralProphet"**  
-- 🔧 **раздел troubleshooting**
-
-Это сделает README **намного сильнее как engineering документацию**.
