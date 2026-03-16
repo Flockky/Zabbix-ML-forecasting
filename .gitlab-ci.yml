@@ -1,0 +1,39 @@
+stages:
+  - discover
+  - sync
+  - forecast
+  - demo
+
+demo_forecast:
+  stage: demo
+  script:
+    - /usr/bin/python3.9 demo_forecast.py
+  dependencies:
+    - run_forecast
+  tags:
+    - cprd-zbx-app01
+
+discover_mountpoints:
+  stage: discover
+  script:
+    - /usr/bin/python3.9 discover_mountpoints.py
+  tags:
+    - cprd-zbx-app01
+
+sync_trends:
+  stage: sync
+  script:
+    - /usr/bin/python3.9 sync_trends.py
+  dependencies:
+    - discover_mountpoints
+  tags:
+    - cprd-zbx-app01
+
+run_forecast:
+  stage: forecast
+  script:
+    - /usr/bin/python3.9 run_forecast.py
+  dependencies:
+    - sync_trends
+  tags:
+    - cprd-zbx-app01
