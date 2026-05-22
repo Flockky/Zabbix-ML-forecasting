@@ -1,14 +1,16 @@
+
 # 📊 Zabbix Disk Capacity Forecast
 
-Сервис для **ежедневного прогнозирования заполнения файловых систем** на основе данных из **Zabbix**.
+Сервис для **автоматического прогнозирования заполнения файловых систем** на основе данных из **Zabbix**.
 
 Проект автоматически:
 
 1. 🔍 Находит все mountpoint'ы в Zabbix  
-2. 📥 Загружает исторические тренды использования дисков  
-3. 🧠 Строит прогноз заполнения с помощью **NeuralProphet**  
-4. 📈 Сохраняет прогноз на **30 / 60 / 90 дней**  
-5. 📊 Позволяет визуализировать результат в **Grafana**
+2. 📥 Загружает и агрегирует исторические тренды (до дневных значений)  
+3. 🧠 Строит прогноз заполнения с помощью **NeuralProphet** (линейный рост, без сезонности)  
+4. ✅ Валидирует точность модели на исторических данных  
+5. 📈 Сохраняет прогнозы на **90 дней** вперед  
+6. 📊 Позволяет визуализировать результат в **Grafana**
 
 Pipeline запускается **раз в сутки через GitLab CI**.
 
@@ -20,30 +22,42 @@ Pipeline запускается **раз в сутки через GitLab CI**.
 
 ```mermaid
 graph TD;
-    A[Zabbix] --> B[discover_mountpoints.py]
-    B --> C[sync_trends.py]
-    C --> D[run_forecast.py]
-    D --> E[demo_forecast.py]
-    E --> F[PostgreSQL]
-    F --> G[Grafana Dashboard]
+    A[Zabbix API] --> B[discover_mountpoints.py]
+    B --> C[(PostgreSQL)]
+    D[sync_trends.py] --> C
+    C --> E[run_forecast.py]
+    C --> F[validation_forecast.py]
+    E --> G[Table: forecasts]
+    F --> H[Table: validation_results]
+    F --> I[Table: demo_forecasts]
+    G & H & I --> J[Grafana Dashboard]
 ```
 
 ### Описание этапов:
 
-1. **Discover**: 
-    - Сканирует активные хосты и находит все mountpoints.
-    - Добавляет/обновляет информацию о дисках в таблицу `prediction_targets`.
-   
-2. **Sync**: 
-    - Синхронизирует данные по трендам использования дисков в базу данных PostgreSQL.
-   
-3. **Forecast**: 
-    - Строит прогнозы на 90 дней с использованием **NeuralProphet**.
-    - Сохраняет прогнозы в таблицу `forecasts`.
+1. **Discover (`discover_mountpoints.py`)**: 
+   - Сканирует активные хосты в Zabbix.
+   - Ищет пары items `vfs.fs.size[/<path>,used]` и `vfs.fs.size[/<path>,total]`.
+   - Сохраняет или обновляет список целевых дисков в таблице `prediction_targets`.
 
-4. **Demo**: 
-    - Генерирует демо-прогнозы и сравнивает их с реальными значениями.
-    - Результаты сохраняются в таблицу `demo_forecasts`.
+2. **Sync (`sync_trends.py`)**: 
+   - Забирает сырые тренды (`trend.get`) из Zabbix за последний год.
+   - **Агрегирует** часовые/минутные данные до **дневных** значений (avg/min/max).
+   - Сохраняет агрегированные данные в `zabbix_trends`.
+   - Обновляет актуальный размер диска в `disk_total`.
+
+3. **Forecast (`run_forecast.py`)**: 
+   - Строит основные прогнозы на **90 дней** вперед.
+   - Использует **NeuralProphet** с линейным ростом (`growth='linear'`) и **отключенной сезонностью** (yearly/weekly/daily = False).
+   - Автоматически детектирует и исключает аномалии (резкие очистки диска >10%).
+   - Результаты сохраняются в таблицу `forecasts`.
+
+4. **Validation (`validation_forecast.py`)**: 
+   - Оценивает качество модели ("Backtesting").
+   - Обучается на данных, обрезанных на 30 дней назад.
+   - Прогнозирует на эти 30 дней и сравнивает с реальностью.
+   - Игнорирует диски, которые не растут (статичные или уменьшающиеся).
+   - Сохраняет метрики ошибок в `validation_results` и полные данные сравнения в `demo_forecasts`.
 
 ---
 
@@ -55,9 +69,13 @@ graph TD;
 
 ### Python зависимости
 
+Для работы требуется установка библиотек для ML и работы с БД:
+
 ```bash
 pip install pandas psycopg2-binary requests neuralprophet torch
 ```
+
+> **Примечание:** Скрипты используют `ProcessPoolExecutor` для параллельного прогнозирования, что значительно ускоряет обработку большого количества дисков.
 
 ---
 
@@ -75,7 +93,7 @@ CREATE TABLE IF NOT EXISTS public.prediction_targets
     itemid text PRIMARY KEY,
     total_itemid text NOT NULL,
     host text NOT NULL,
-    name text NOT NULL,
+    name text NOT NULL, -- Mount point path
     alert_threshold_pct double precision DEFAULT 90.0,
     enabled boolean DEFAULT true,
     last_discovered_at timestamp with time zone DEFAULT now()
@@ -84,13 +102,13 @@ CREATE TABLE IF NOT EXISTS public.prediction_targets
 
 ## Таблица: `zabbix_trends`
 
-Хранит агрегированные дневные значения использования дисков.
+Хранит **агрегированные дневные** значения использования дисков.
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.zabbix_trends
 (
     itemid text NOT NULL,
-    clock bigint NOT NULL,
+    clock bigint NOT NULL, -- Timestamp start of the day
     value_avg double precision,
     value_min double precision,
     value_max double precision
@@ -102,7 +120,7 @@ ON public.zabbix_trends (itemid, clock);
 
 ## Таблица: `disk_total`
 
-Хранит общий размер диска.
+Хранит общий размер диска (обновляется раз в сутки).
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.disk_total
@@ -116,54 +134,56 @@ CREATE TABLE IF NOT EXISTS public.disk_total
 
 ## Таблица: `forecasts`
 
-Основная таблица прогнозов.
+Основная таблица прогнозов (на 90 дней).
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.forecasts
 (
     itemid text NOT NULL,
+    run_id text,
     forecast_run_at timestamp with time zone NOT NULL,
     ds timestamp with time zone NOT NULL,
-    yhat double precision,
-    yhat_lower double precision,
-    yhat_upper double precision,
+    yhat double precision,       -- Predicted value
+    yhat_lower double precision, -- Lower bound (quantile 0.1)
+    yhat_upper double precision, -- Upper bound (quantile 0.9)
     threshold_pct double precision,
-    fill_date_est timestamp with time zone,
-    run_id text
+    fill_date_est timestamp with time zone -- Estimated date when threshold is reached
 );
+
+CREATE INDEX idx_forecasts_itemid_runat ON public.forecasts (itemid, forecast_run_at DESC);
 ```
 
-Индексы:
+## Таблица: `validation_results`
+
+Результаты валидации модели (ошибка в днях).
 
 ```sql
-CREATE INDEX idx_forecasts_itemid_runat
-ON public.forecasts (itemid, forecast_run_at DESC);
-
-CREATE INDEX idx_forecasts_run_id
-ON public.forecasts (run_id);
+CREATE TABLE IF NOT EXISTS public.validation_results
+(
+    itemid text PRIMARY KEY,
+    error_days double precision, -- Error in days (absolute difference / avg daily growth)
+    disk_name text,
+    validated_at timestamp with time zone DEFAULT now(),
+    is_invalid_growth boolean DEFAULT false -- True if disk is not growing
+);
 ```
 
 ## Таблица: `demo_forecasts`
 
-Таблица для тестирования модели.
+Детальные данные валидации (прогноз vs факт по дням).
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.demo_forecasts
 (
     itemid text,
-    ds timestamp,
-    yhat real,
-    actual_y real,
+    ds timestamp with time zone,
+    yhat double precision,
+    actual_y double precision,
     run_id text,
-    created_at timestamp DEFAULT now()
+    created_at timestamp with time zone DEFAULT now()
 );
-```
 
-Индекс:
-
-```sql
-CREATE INDEX idx_demo_itemid_ds
-ON public.demo_forecasts (itemid, ds);
+CREATE INDEX idx_demo_itemid_ds ON public.demo_forecasts (itemid, ds);
 ```
 
 ---
@@ -173,13 +193,16 @@ ON public.demo_forecasts (itemid, ds);
 Все настройки передаются через **environment variables**.
 
 ```bash
-ZABBIX_URL=https://zabbix/api_jsonrpc.php
+# Zabbix Connection
+ZABBIX_URL=https://zabbix.example.com/api_jsonrpc.php
 ZABBIX_API_TOKEN=xxxxxxxxxxxx
 
+# Database Connection
 DB_DBNAME=zabbix_forecast
 DB_USER=postgres
 DB_PASSWORD=password
 DB_HOST=localhost
+DB_PORT=5432
 ```
 
 ---
@@ -188,191 +211,109 @@ DB_HOST=localhost
 
 ## discover_mountpoints.py
 
-🔍 Находит все файловые системы в Zabbix.
-
-Что делает:
-
-- получает список активных хостов
-- ищет items `vfs.fs.size`
-- сопоставляет пары:
-
-```id="s8s5h8"
-used
-total
-```
-
-- сохраняет их в таблицу:
-
-```id="51l1me"
-prediction_targets
-```
-
-Также обновляет:
-
-```id="s3657l"
-last_discovered_at
-```
+🔍 **Поиск дисков.**
+- Подключается к Zabbix API.
+- Фильтрует только активные хосты.
+- Парсит ключи `vfs.fs.size[...]`.
+- Сохраняет пары `used`/`total` в БД. Если диск уже есть, обновляет его метаданные и timestamp обнаружения.
 
 ## sync_trends.py
 
-📥 Синхронизирует данные из Zabbix.
-
-Функции:
-
-- загружает **trend.get**
-- агрегирует данные до **дневных значений**
-- сохраняет их в:
-
-```id="il2qgi"
-zabbix_trends
-```
-
-Также:
-
-- обновляет размер диска в `disk_total`
-- удаляет данные старше **365 дней**
+📥 **Синхронизация данных.**
+- Загружает тренды из Zabbix за последние 365 дней.
+- **Агрегация:** Группирует данные по дням (среднее, мин, макс за сутки).
+- **Оптимизация:** Использует `ThreadPoolExecutor` для параллельного опроса Zabbix.
+- Удаляет старые данные из БД (> 365 дней).
+- Обновляет текущий объем диска (`disk_total`) на основе последних 7 дней трендов.
 
 ## run_forecast.py
 
-🧠 Основной скрипт прогнозирования.
+🧠 **Основное прогнозирование.**
+- Использует **NeuralProphet**.
+- **Настройки модели:**
+  - `growth='linear'`
+  - `seasonality=False` (год/неделя/день отключены для стабильности на коротких горизонтах).
+  - `quantiles=[0.1, 0.9]` для оценки неопределенности.
+- **Preprocessing:** Detects cleanups (drops > 10% of total size) and removes anomaly points from training data.
+- **Parallelism:** Uses `ProcessPoolExecutor` (up to 8 workers) to forecast multiple disks simultaneously.
+- Saves results to `forecasts`.
 
-Использует библиотеку:
+## validation_forecast.py
 
-```id="eb8koz"
-NeuralProphet
-```
-
-Особенности модели:
-
-- линейный рост
-- недельная сезонность
-- обучение на 365 днях истории
-- прогноз на **90 дней**
-
-Также:
-
-- автоматически обнаруживает **cleanup (резкое освобождение диска)**
-- удаляет аномалии из обучающего набора
-
-Результаты сохраняются в:
-
-```id="0tyr4s"
-forecasts
-```
-
-## demo_forecast.py
-
-📊 Демонстрационный режим для проверки точности модели.
-
-Механика:
-
-1. обучается на данных **до 7 дней назад**
-2. строит прогноз
-3. сравнивает его с **реальными значениями**
-
-Результаты сохраняются в:
-
-```id="ueh17c"
-demo_forecasts
-```
-
-Используется для:
-
-- оценки качества модели
-- построения графиков точности
+✅ **Валидация модели.**
+- Запускается отдельно для оценки качества.
+- **Логика:**
+  1. Берет историю до `T - 30 days`.
+  2. Строит прогноз на 30 дней вперед.
+  3. Сравнивает прогноз с реальными данными, которые уже появились в Zabbix.
+- **Фильтрация:** Если диск не растет (или уменьшается), он помечается как `is_invalid_growth` и исключается из расчета средних метрик ошибки.
+- Сохраняет итоговую ошибку (в днях) в `validation_results`.
+- Сохраняет подневное сравнение в `demo_forecasts`.
 
 ---
 
 # 🚀 GitLab CI Pipeline
 
-Файл:
-
-```id="8knzrc"
-.gitlab-ci.yml
-```
-
-Pipeline состоит из 4 стадий:
+Файл `.gitlab-ci.yml` должен содержать следующие стадии. Рекомендуется запускать `validation` реже (например, раз в неделю) или после `forecast`.
 
 ```yaml
 stages:
   - discover
   - sync
   - forecast
-  - demo
-```
+  - validate
 
-### Discover
+variables:
+  PYTHON_IMAGE: "python:3.9-slim"
 
-```yaml
+before_script:
+  - pip install pandas psycopg2-binary requests neuralprophet torch
+
 discover_mountpoints:
   stage: discover
   script:
-    - /usr/bin/python3.9 discover_mountpoints.py
-```
+    - python discover_mountpoints.py
 
-### Sync
-
-```yaml
 sync_trends:
   stage: sync
   script:
-    - /usr/bin/python3.9 sync_trends.py
-```
+    - python sync_trends.py
 
-### Forecast
-
-```yaml
 run_forecast:
   stage: forecast
   script:
-    - /usr/bin/python3.9 run_forecast.py
-```
+    - python run_forecast.py
 
-### Demo
-
-```yaml
-demo_forecast:
-  stage: demo
+validate_model:
+  stage: validate
   script:
-    - /usr/bin/python3.9 demo_forecast.py
+    - python validation_forecast.py
+  only:
+    - schedules # Запускать по расписанию, например, раз в неделю
 ```
 
 ---
 
 # 📈 Grafana
 
-Для визуализации используется **Grafana dashboard**.
+Для визуализации используйте **Grafana Dashboard**.
 
-Импортируйте файл:
-
-```id="vrvmqj"
-grafana_dashboard.json
-```
-
-В Grafana:
-
-```id="mfopbv"
-Dashboards → Import → Upload JSON
-```
+Основные панели:
+1. **Forecast Chart:** График `yhat` (прогноз) с облаком `yhat_lower`/`yhat_upper` и реальными точками.
+2. **Fill Date:** Дата достижения порога (например, 90%).
+3. **Validation Error:** График ошибки модели (из таблицы `validation_results`).
 
 Datasource: **PostgreSQL**
 
 ---
 
-# 🧠 Как работает модель **NeuralProphet**
+# 🧠 Особенности модели NeuralProphet
 
-Модель **NeuralProphet** — это улучшение библиотеки Prophet с использованием нейронных сетей. Она позволяет учитывать сезонные колебания в данных и корректировать прогнозы с учетом этих паттернов. В отличие от традиционного **Prophet**, NeuralProphet использует **глубокие нейронные сети** для обработки данных.
+В данной реализации используется упрощенная конфигурация **NeuralProphet** для повышения стабильности прогнозов на инфраструктурных данных:
 
-Основные параметры модели:
-
-- **yearly_seasonality**: отключена (предположено, что для большинства дисков годовая сезонность не имеет значения)
-- **weekly_seasonality**: включена (еженедельные циклы важны для использования дисков)
-- **daily_seasonality**: отключена
-- **growth**: линейный рост (предполагается, что заполнение дисков будет расти линейно)
-- **epochs**: 30 (количество эпох для обучения)
-- **batch_size**: 64 (размер батча)
-- **learning_rate**: 1.0
-
-Модель обучается на **исторических данных** о заполнении дисков за последний год, а затем делает прогнозы на **90 дней вперед**.
-
----
+- **Сезонность отключена:** `yearly`, `weekly` и `daily` сезонности выключены. Практика показала, что для дисковых квот и логов линейный тренд часто точнее, чем попытки уловить сложные циклы, которые могут шуметь.
+- **Линейный рост:** `growth='linear'`. Предполагается, что заполнение диска — процесс накопительный.
+- **Квантили:** Используются `[0.1, 0.9]` для построения доверительного интервала.
+- **Обработка аномалий:** Скрипт самостоятельно находит резкие падения объема (очистка логов/бэкапов) и выбрасывает эти точки из обучения, чтобы модель не "училась" на том, что диск внезапно стал пустым.
+- **Параллелизм:** Прогнозирование разбито на процессы (`ProcessPoolExecutor`), так как NeuralProphet (PyTorch) требует ресурсов CPU. Это позволяет обрабатывать сотни дисков за минуты.
+```
