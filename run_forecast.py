@@ -97,12 +97,13 @@ def forecast_single_disk(itemid, total_itemid, threshold_pct, db_config):
 
         m = NeuralProphet(
             yearly_seasonality=False,
-            weekly_seasonality=True,
+            weekly_seasonality=False,
             daily_seasonality=False,
             growth='linear',
             epochs=30,
             batch_size=64,
-            learning_rate=1.0
+            learning_rate=1.0,
+            quantiles=[0.1, 0.9]
         )
         m.fit(df, freq='D')
 
